@@ -1,96 +1,70 @@
 import asyncio
-import base64
 import json
-import time
+import socket
 import hashlib
-from i2plib import Tunnel, SAMSession, get_sam_socket
+import base64
+import time
 from cryptography.fernet import Fernet
 
-
 class DHTManager:
-    def __init__(self, username, discovery_passphrase=None, port=55555):
+    def __init__(self, username: str, passphrase: str = ""):
         self.username = username
-        self.discovery_passphrase = discovery_passphrase
-        self.session = None
-        self.tunnel = None
-        self.users = {}
+        self.passphrase = passphrase
         self.running = False
+        self.known_users = {}
+        self.broadcast_port = 50505
+        self.loop = asyncio.get_event_loop()
+
+        key = hashlib.sha256(passphrase.encode() or b"default").digest()
+        self.fernet = Fernet(base64.urlsafe_b64encode(key[:32]))
 
     async def start(self):
-        print("[I2P] Запуск SAM-сессии...")
-        self.session = SAMSession(nickname=self.username, destination=None)
-        self.tunnel = Tunnel(self.session)
-        await self.tunnel.start()
-
-        print(f"[I2P] Ваш скрытый адрес: {self.session.dest.base32}.b32.i2p")
         self.running = True
-        asyncio.create_task(self.broadcast_presence())
-        asyncio.create_task(self.listen_loop())
+        asyncio.create_task(self._broadcast_loop())
+        asyncio.create_task(self._listen_loop())
 
-    async def broadcast_presence(self):
-        """Отправка своего адреса в I2P DHT."""
-        while self.running:
-            payload = {
-                "user": self.username,
-                "addr": self.session.dest.base32,
-                "timestamp": time.time()
-            }
-            data = json.dumps(payload).encode()
-            if self.discovery_passphrase:
-                fernet = Fernet(self._derive_key())
-                data = fernet.encrypt(data)
-
-            # Публикация в I2P DHT (через локальный SAM API)
-            try:
-                sock = get_sam_socket()
-                msg = b"namestore.set key=" + self.username.encode() + b" value=" + data + b"\n"
-                sock.send(msg)
-                sock.close()
-            except Exception as e:
-                print("[!] Ошибка публикации:", e)
-
-            await asyncio.sleep(15)
-
-    async def listen_loop(self):
-        """Периодически опрашивает I2P DHT о других пользователях."""
-        while self.running:
-            try:
-                sock = get_sam_socket()
-                sock.send(b"namestore.list\n")
-                resp = sock.recv(8192)
-                sock.close()
-
-                for line in resp.splitlines():
-                    if not line.startswith(b"value="):
-                        continue
-                    try:
-                        raw = line.split(b"value=")[1]
-                        if self.discovery_passphrase:
-                            raw = Fernet(self._derive_key()).decrypt(raw)
-                        payload = json.loads(raw.decode())
-                        user = payload["user"]
-                        addr = payload["addr"]
-                        if user != self.username:
-                            self.users[user] = (addr, payload["timestamp"])
-                    except Exception:
-                        pass
-            except Exception as e:
-                print("[!] Ошибка опроса DHT:", e)
-
-            await asyncio.sleep(20)
-
-    async def find_user(self, name):
-        return self.users.get(name, (None, None))[0]
-
-    def _derive_key(self):
-        """Создаёт 32-байтный AES ключ из passphrase."""
-        key = hashlib.sha256(self.discovery_passphrase.encode()).digest()
-        return base64.urlsafe_b64encode(key)
-
-    async def close(self):
+    async def stop(self):
         self.running = False
-        if self.tunnel:
-            await self.tunnel.stop()
-        if self.session:
-            await self.session.close()
+
+    async def _broadcast_loop(self):
+        """Периодически рассылает зашифрованные объявления о себе."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        msg = json.dumps({
+            "username": self.username,
+            "timestamp": time.time(),
+        }).encode()
+
+        while self.running:
+            try:
+                encrypted = self.fernet.encrypt(msg)
+                sock.sendto(encrypted, ("255.255.255.255", self.broadcast_port))
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+    async def _listen_loop(self):
+        """Принимает зашифрованные пакеты и обновляет список пользователей."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", self.broadcast_port))
+        sock.setblocking(False)
+
+        while self.running:
+            await asyncio.sleep(0.1)
+            try:
+                data, addr = sock.recvfrom(4096)
+                info = json.loads(self.fernet.decrypt(data).decode())
+                user = info.get("username")
+                if user and user != self.username:
+                    self.known_users[user] = time.time()
+            except Exception:
+                pass
+
+            # Очистка неактивных пользователей
+            now = time.time()
+            self.known_users = {u: t for u, t in self.known_users.items() if now - t < 15}
+
+    def get_known_users(self):
+        """Возвращает список известных активных пользователей."""
+        return list(self.known_users.keys())
 
