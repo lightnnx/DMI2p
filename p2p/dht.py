@@ -1,133 +1,96 @@
-# p2p/dht.py
 import asyncio
-import json
-import socket
-import hashlib
 import base64
+import json
+import time
+import hashlib
+from i2plib import Tunnel, SAMSession, get_sam_socket
 from cryptography.fernet import Fernet
 
-class DHTManager:
-    """
-    UDP-based discovery with encrypted broadcasts.
-    discovery_passphrase: str or None. If provided, announce payloads are encrypted using a symmetric key
-    derived from the passphrase. Only peers with the same passphrase can decrypt and learn usernames.
-    """
-    def __init__(self, username: str, port: int = 55555, discovery_passphrase: str | None = None):
-        self.username = username
-        self.port = port
-        self.users = {}  # username -> (addr, seen_time)
-        self.transport = None
-        self._loop = asyncio.get_event_loop()
 
-        # prepare Fernet key from passphrase (if provided)
-        if discovery_passphrase:
-            h = hashlib.sha256(discovery_passphrase.encode()).digest()  # 32 bytes
-            self._fernet_key = base64.urlsafe_b64encode(h)  # valid for Fernet
-            self._fernet = Fernet(self._fernet_key)
-        else:
-            self._fernet_key = None
-            self._fernet = None
+class DHTManager:
+    def __init__(self, username, discovery_passphrase=None, port=55555):
+        self.username = username
+        self.discovery_passphrase = discovery_passphrase
+        self.session = None
+        self.tunnel = None
+        self.users = {}
+        self.running = False
 
     async def start(self):
-        # create a UDP endpoint that will call datagram_received on this instance
-        listen = self._loop.create_datagram_endpoint(
-            lambda: self,
-            local_addr=("0.0.0.0", self.port),
-            allow_broadcast=True
-        )
-        self.transport, _ = await listen
-        print(f"[DHT] Слушаю UDP {self.port} (encrypted discovery {'ON' if self._fernet else 'OFF'})")
+        print("[I2P] Запуск SAM-сессии...")
+        self.session = SAMSession(nickname=self.username, destination=None)
+        self.tunnel = Tunnel(self.session)
+        await self.tunnel.start()
 
-        # Periodic broadcast announce
-        self._announce_task = asyncio.create_task(self._periodic_announce())
+        print(f"[I2P] Ваш скрытый адрес: {self.session.dest.base32}.b32.i2p")
+        self.running = True
+        asyncio.create_task(self.broadcast_presence())
+        asyncio.create_task(self.listen_loop())
 
-    async def _periodic_announce(self):
-        try:
-            while True:
-                await self.broadcast_announce()
-                await asyncio.sleep(5)
-        except asyncio.CancelledError:
-            pass
+    async def broadcast_presence(self):
+        """Отправка своего адреса в I2P DHT."""
+        while self.running:
+            payload = {
+                "user": self.username,
+                "addr": self.session.dest.base32,
+                "timestamp": time.time()
+            }
+            data = json.dumps(payload).encode()
+            if self.discovery_passphrase:
+                fernet = Fernet(self._derive_key())
+                data = fernet.encrypt(data)
 
-    async def broadcast_announce(self):
-        """
-        Build announce payload and broadcast it.
-        If Fernet configured -> encrypt payload; else send plaintext JSON.
-        """
-        payload = {
-            "type": "announce",
-            "user": self.username
-            # you can add extra fields like 'pubkey' here if needed (careful about size)
-        }
-        plain = json.dumps(payload).encode()
-
-        if self._fernet:
-            token = self._fernet.encrypt(plain)
-            msg = token
-        else:
-            msg = plain
-
-        # send to broadcast address
-        try:
-            self.transport.sendto(msg, ("255.255.255.255", self.port))
-        except Exception as e:
-            # sometimes on Windows binding/broadcast settings might fail; ignore for robustness
-            # fallback: send to localhost
+            # Публикация в I2P DHT (через локальный SAM API)
             try:
-                self.transport.sendto(msg, ("127.0.0.1", self.port))
-            except Exception:
-                pass
+                sock = get_sam_socket()
+                msg = b"namestore.set key=" + self.username.encode() + b" value=" + data + b"\n"
+                sock.send(msg)
+                sock.close()
+            except Exception as e:
+                print("[!] Ошибка публикации:", e)
 
-    # DatagramProtocol callbacks ------------------------------------------------
-    def connection_made(self, transport):
-        # required by asyncio.DatagramProtocol, but we already store transport externally
-        self.transport = transport
+            await asyncio.sleep(15)
 
-    def datagram_received(self, data: bytes, addr):
-        """
-        Called by asyncio when UDP packet arrives.
-        Try to decrypt if _fernet is set; otherwise parse JSON.
-        """
-        try:
-            if self._fernet:
-                # try decrypt; if fails, ignore packet
-                try:
-                    plain = self._fernet.decrypt(data, ttl=None)
-                except Exception:
-                    # not decryptable with our key — ignore
-                    return
-            else:
-                plain = data
+    async def listen_loop(self):
+        """Периодически опрашивает I2P DHT о других пользователях."""
+        while self.running:
+            try:
+                sock = get_sam_socket()
+                sock.send(b"namestore.list\n")
+                resp = sock.recv(8192)
+                sock.close()
 
-            msg = json.loads(plain.decode())
-            if msg.get("type") == "announce":
-                user = msg.get("user")
-                if user and user != self.username:
-                    # store last-seen address and timestamp
-                    self.users[user] = (addr, self._loop.time())
-                    print(f"[DHT] Обнаружен {user} по адресу {addr}")
-        except Exception:
-            # ignore malformed packets
-            return
+                for line in resp.splitlines():
+                    if not line.startswith(b"value="):
+                        continue
+                    try:
+                        raw = line.split(b"value=")[1]
+                        if self.discovery_passphrase:
+                            raw = Fernet(self._derive_key()).decrypt(raw)
+                        payload = json.loads(raw.decode())
+                        user = payload["user"]
+                        addr = payload["addr"]
+                        if user != self.username:
+                            self.users[user] = (addr, payload["timestamp"])
+                    except Exception:
+                        pass
+            except Exception as e:
+                print("[!] Ошибка опроса DHT:", e)
 
-    async def find_user(self, username: str):
-        """
-        Return address tuple of the username if known (from recent announces), else None.
-        """
-        entry = self.users.get(username)
-        if not entry:
-            return None
-        addr, seen = entry
-        # optional: expire entries older than e.g. 300s
-        if self._loop.time() - seen > 300:
-            del self.users[username]
-            return None
-        return addr
+            await asyncio.sleep(20)
+
+    async def find_user(self, name):
+        return self.users.get(name, (None, None))[0]
+
+    def _derive_key(self):
+        """Создаёт 32-байтный AES ключ из passphrase."""
+        key = hashlib.sha256(self.discovery_passphrase.encode()).digest()
+        return base64.urlsafe_b64encode(key)
 
     async def close(self):
-        if hasattr(self, "_announce_task"):
-            self._announce_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._announce_task
-        if self.transport:
-            self.transport.close()
+        self.running = False
+        if self.tunnel:
+            await self.tunnel.stop()
+        if self.session:
+            await self.session.close()
+
