@@ -1,6 +1,6 @@
 from .crypto import *
 import asyncio
-from i2p import sam  # Убедись, что установлено i2ppy: pip install i2ppy
+from i2p import sam  # pip install i2ppy
 
 class P2PNode:
     """
@@ -29,14 +29,19 @@ class P2PNode:
         self.destination = self.session.dest.b32
         print(f"[P2P] Узел {self.username} готов: {self.destination}.b32.i2p")
 
-    async def find_peer(self, peer_name: str, dest_b32: str):
+    async def find_peer(self, peer_name: str, peer_addr: str = None):
         """
-        Ищем пользователя через известный .b32.i2p адрес.
-        peer_name — для логов, dest_b32 — полный base32 адрес.
+        Задает адрес собеседника. Если адрес известен, используем его напрямую.
         """
-        self.peer_addr = dest_b32
-        print(f"[P2P] Пользователь {peer_name} найден: {self.peer_addr}.b32.i2p")
-        return self.peer_addr
+        if peer_addr:
+            self.peer_addr = peer_addr
+            print(f"[P2P] Найден {peer_name}: {self.peer_addr}.b32.i2p")
+            return self.peer_addr
+        elif self.peer_addr:
+            return self.peer_addr
+        else:
+            print(f"[P2P] ❌ Адрес {peer_name} неизвестен.")
+            return None
 
     def establish_secure_channel(self):
         """Создание AES ключа для чата."""
@@ -44,18 +49,22 @@ class P2PNode:
         print("[P2P] 🔐 AES-ключ установлен.")
         return self.aes_key
 
-    async def send_secure_message(self, message: str):
+    async def send_secure_message(self, message: str, peer_addr: str = None):
         """Отправка зашифрованного сообщения через SAM."""
+        if peer_addr:
+            self.peer_addr = peer_addr
+
         if not self.peer_addr:
             print("[P2P] Нет адреса получателя. Используй find_peer() сначала.")
             return
+
         if not self.aes_key:
             self.establish_secure_channel()
 
         encrypted = aes_encrypt(self.aes_key, message)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self.session.send(self.peer_addr + ".b32.i2p", encrypted))
-        print(f"[P2P] Отправлено зашифрованное сообщение -> {self.peer_addr}.b32.i2p")
+        print(f"[P2P] Отправлено -> {self.peer_addr}.b32.i2p")
 
     async def listen_secure(self):
         """Прослушивание входящих сообщений через SAM."""
